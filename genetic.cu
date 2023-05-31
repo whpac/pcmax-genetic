@@ -1,5 +1,3 @@
-// %%cu
-
 #include <stdbool.h>
 #include <limits.h>
 #include <string.h>
@@ -11,7 +9,7 @@
 #define GREEDY_MUTATION_CHANCE 0.3            // Prawdopodobieństwo, że mutacja będzie zachłanna
 #define GREEDY_MUTATION_ITERATIONS 5          // Liczba iteracji, podczas zachłannej mutacji
 #define MAX_DURATION 300                      // Maksymalny czas pracy w sekundach
-#define MAX_ITERATIONS 5000000                // Maksymalna liczba iteracji
+#define MAX_ITERATIONS 500000                 // Maksymalna liczba iteracji
 #define MIGRATION_CHANCE 0.002                // Prawdopodobieństwo migracji
 #define MUTATIONS_IN_SOLUTION 2               // Liczba mutacji w rozwiązaniu
 #define POPULATION_SIZE 100                   // Rozmiar populacji
@@ -20,10 +18,9 @@
 #define SOLUTION_CROSSOVER_CHANCE 0.85        // Prawdopodobieństwo, że rozwiązanie się rozmnoży
 #define SOLUTION_MUTATION_CHANCE 0.05         // Prawdopodobieństwo, że w rozwiązaniu zajdzie mutacja
 
-#define MAX_TASKS 250
+#define MAX_TASKS 1000
 #define MAX_PROCESSORS 50
-#define NUM_THREADS 32
-#define NUM_BLOCKS 16
+#define NUM_THREADS 1024
 
 // Diagnostyka
 #define ENABLE_EXPORT false                   // Czy eksportować wyniki na koniec
@@ -44,26 +41,25 @@ typedef struct {
 } CudaOutput;
 
 // Dane problemu
-__device__ __constant__ int processorCount;            // Liczba procesorów
-__device__ __constant__ int taskCount;                 // Liczba zadań
-__device__ __constant__ int executionTimes[MAX_TASKS]; // Tablica czasów wykonania zadań
-__device__ bool isFinished;                            // Czy algorytm zakończył działanie
+__device__ __constant__ int processorCount;       // Liczba procesorów
+__device__ __constant__ int taskCount;            // Liczba zadań
+__device__ __constant__ int executionTimes[2048]; // Tablica czasów wykonania zadań
 
 
 
 __global__ void genetic(const long long tresholdCmax, unsigned int randSeed, CudaOutput* cudaOut);
-__device__ void doGeneticIteration(RandSeed seed, Solution* population, const Solution* bestSolution, int* executionTimes);
-__device__ void generateInitialSolutions(RandSeed seed, Solution* population, int* executionTimes);
-__device__ void buildSolutionRandom(RandSeed seed, Solution* solution, int* executionTimes);
-__device__ void buildSolutionGreedy(RandSeed seed, Solution* solution, int* executionTimes);
-__device__ void performCrossOvers(RandSeed seed, Solution* population, int* executionTimes);
-__device__ void crossOver(RandSeed seed, Solution* parent1, Solution* parent2, Solution* child, int* executionTimes);
-__device__ void performMutations(RandSeed seed, Solution* population, int* executionTimes);
-__device__ void mutate(RandSeed seed, Solution* solution, int* executionTimes);
-__device__ void greedyMutate(Solution* solution, int* executionTimes);
+__device__ void doGeneticIteration(RandSeed seed, Solution* population, const Solution* bestSolution);
+__device__ void generateInitialSolutions(RandSeed seed, Solution* population);
+__device__ void buildSolutionRandom(RandSeed seed, Solution* solution);
+__device__ void buildSolutionGreedy(RandSeed seed, Solution* solution);
+__device__ void performCrossOvers(RandSeed seed, Solution* population);
+__device__ void crossOver(RandSeed seed, Solution* parent1, Solution* parent2, Solution* child);
+__device__ void performMutations(RandSeed seed, Solution* population);
+__device__ void mutate(RandSeed seed, Solution* solution);
+__device__ void greedyMutate(Solution* solution);
 __device__ void updateBestSolution(Solution* population, Solution* bestSolution);
-__device__ void performMigration(RandSeed seed, Solution* population, const Solution* bestSolution, int* executionTimes);
-__device__ void measureSolutionCmax(Solution* solution, int* executionTimes);
+__device__ void performMigration(RandSeed seed, Solution* population, const Solution* bestSolution);
+__device__ void measureSolutionCmax(Solution* solution);
 void loadData(int** executionTimes, int* processorCount, int* taskCount);
 
 
@@ -92,56 +88,42 @@ __global__ void genetic(const long long tresholdCmax, unsigned int randSeed, Cud
 
     __shared__ CudaOutput cudaOut_local[NUM_THREADS];
 
+    __syncthreads();
+
     int iterations = 0;
 
-    __shared__ int executionTimes_sh[MAX_TASKS];
-    for(int i = tId; i < taskCount; i+= NUM_THREADS){
-        executionTimes_sh[i] = executionTimes[i];
-    }
-
     // Allocate the population
-    __shared__ ProcId taskMem[MAX_TASKS * POPULATION_SIZE];
-    __shared__ Solution population[POPULATION_SIZE];
-    for(int i = tId; i < POPULATION_SIZE; i += NUM_THREADS){
+    ProcId taskMem[MAX_TASKS * POPULATION_SIZE];
+    Solution population[POPULATION_SIZE];
+    for(int i = 0; i < POPULATION_SIZE; ++i){
         population[i].tasks = &taskMem[i * taskCount];
     }
 
-    __syncthreads();
-
     // Prepare the population
-    generateInitialSolutions(&randSeed, population, executionTimes_sh);
+    generateInitialSolutions(&randSeed, population);
 
     // Save the best solution (and allocate the memory for it)
-    __shared__ ProcId bestSolutionTasks[MAX_TASKS];
-    __shared__ Solution bestSolution;
+    ProcId bestSolutionTasks[MAX_TASKS];
+    Solution bestSolution;
     bestSolution.tasks = bestSolutionTasks;
     bestSolution.cmax = LLONG_MAX;
-    if(tId == 0) updateBestSolution(population, &bestSolution);
+    updateBestSolution(population, &bestSolution);
 
     while(iterations < MAX_ITERATIONS) {
-        doGeneticIteration(&randSeed, population, &bestSolution, executionTimes_sh);
-        if(tId == 0) updateBestSolution(population, &bestSolution);
+        doGeneticIteration(&randSeed, population, &bestSolution);
+        updateBestSolution(population, &bestSolution);
 
         ++iterations;
 
         // If any thread finds a solution, stop the entire block
         if(bestSolution.cmax <= tresholdCmax){
             earlyStop = true;
-            isFinished = true;
-            __threadfence();
         }
         if (earlyStop) break;
-
-        if(tId == 0 && (iterations & 0x3ff) == 0) {
-            earlyStop = isFinished;
-        }
     }
 
     cudaOut_local[tId].iterations = iterations;
     cudaOut_local[tId].bestCmax = bestSolution.cmax;
-    // for(int i = 0; i < taskCount; i++) {
-    //     cudaOut_local[tId].tasks[i] = bestSolution.tasks[i];
-    // }
 
     __threadfence();
     __syncthreads();
@@ -153,9 +135,6 @@ __global__ void genetic(const long long tresholdCmax, unsigned int randSeed, Cud
             if(cudaOut_local[i].bestCmax < cudaOut->bestCmax){
                 cudaOut->bestCmax = cudaOut_local[i].bestCmax;
                 cudaOut->iterations = cudaOut_local[i].iterations;
-                // for(int j = 0; j < taskCount; j++) {
-                //     cudaOut->tasks[j] = cudaOut_local[i].tasks[j];
-                // }
             }
         }
     }
@@ -168,10 +147,10 @@ __global__ void genetic(const long long tresholdCmax, unsigned int randSeed, Cud
  * @param population The current population
  * @param bestSolution The best solution in the history
  */
-__device__ void doGeneticIteration(RandSeed seed, Solution* population, const Solution* bestSolution, int* executionTimes){
-    performCrossOvers(seed, population, executionTimes);
-    performMutations(seed, population, executionTimes);
-    performMigration(seed, population, bestSolution, executionTimes);
+__device__ void doGeneticIteration(RandSeed seed, Solution* population, const Solution* bestSolution){
+    performCrossOvers(seed, population);
+    performMutations(seed, population);
+    performMigration(seed, population, bestSolution);
 }
 
 
@@ -180,15 +159,13 @@ __device__ void doGeneticIteration(RandSeed seed, Solution* population, const So
  * @param seed The seed for the random number generator
  * @param population The population to fill
  */
-__device__ void generateInitialSolutions(RandSeed seed, Solution* population, int* executionTimes){
+__device__ void generateInitialSolutions(RandSeed seed, Solution* population){
     const int randomCount = POPULATION_SIZE * RANDOM_SOLUTIONS;
-    int tId = threadIdx.x;
-    int i = tId;
-    for(; i < randomCount; i+= NUM_THREADS){
-        buildSolutionRandom(seed, &population[i], executionTimes);
+    for(int i = 0; i < randomCount; ++i){
+        buildSolutionRandom(seed, &population[i]);
     }
-    for(; i < POPULATION_SIZE; i += NUM_THREADS){
-        buildSolutionGreedy(seed, &population[i], executionTimes);
+    for(int i = randomCount; i < POPULATION_SIZE; ++i){
+        buildSolutionGreedy(seed, &population[i]);
     }
 }
 
@@ -197,13 +174,13 @@ __device__ void generateInitialSolutions(RandSeed seed, Solution* population, in
  * @param seed The seed for the random number generator
  * @param solution Where to save the solution
  */
-__device__ void buildSolutionRandom(RandSeed seed, Solution* solution, int* executionTimes){
+__device__ void buildSolutionRandom(RandSeed seed, Solution* solution){
     long long sum = 0;
     for(int i = 0; i < taskCount; ++i){
         solution->tasks[i] = randInt(seed) % processorCount;
         sum++;
     }
-    measureSolutionCmax(solution, executionTimes);
+    measureSolutionCmax(solution);
 }
 
 
@@ -212,7 +189,7 @@ __device__ void buildSolutionRandom(RandSeed seed, Solution* solution, int* exec
  * @param seed The seed for the random number generator
  * @param solution Where to save the solution
  */
-__device__ void buildSolutionGreedy(RandSeed seed, Solution* solution, int* executionTimes){
+__device__ void buildSolutionGreedy(RandSeed seed, Solution* solution){
     long long processorUsage[MAX_PROCESSORS];
     int taskOrder[MAX_TASKS];
 
@@ -243,7 +220,7 @@ __device__ void buildSolutionGreedy(RandSeed seed, Solution* solution, int* exec
         solution->tasks[t] = minIndex;
         processorUsage[minIndex] += executionTimes[t];
     }
-    measureSolutionCmax(solution, executionTimes);
+    measureSolutionCmax(solution);
 }
 
 
@@ -253,11 +230,15 @@ __device__ void buildSolutionGreedy(RandSeed seed, Solution* solution, int* exec
  * @param seed The seed for the random number generator
  * @param population The population to perform crossovers on
  */
-__device__ void performCrossOvers(RandSeed seed, Solution* population, int* executionTimes){
+__device__ void performCrossOvers(RandSeed seed, Solution* population){
     int crossOvers = POPULATION_SIZE * POPULATION_TO_DIE;
-    int tId = threadIdx.x;
 
-    for(int i = tId; i < crossOvers; i += NUM_THREADS){
+    while(crossOvers > 0){
+        // TODO: Optimize
+        if((randInt(seed) / (float)RAND_MAX) >= SOLUTION_CROSSOVER_CHANCE){
+            continue;
+        }
+
         int p1, p2, c; // Indices of: parent1, parent2, child
         p1 = randInt(seed) % POPULATION_SIZE;
         do{
@@ -267,7 +248,8 @@ __device__ void performCrossOvers(RandSeed seed, Solution* population, int* exec
             c = randInt(seed) % POPULATION_SIZE;
         } while(p1 == c || p2 == c);
 
-        crossOver(seed, &population[p1], &population[p2], &population[c], executionTimes);
+        crossOver(seed, &population[p1], &population[p2], &population[c]);
+        --crossOvers;
     }
 }
 
@@ -279,7 +261,7 @@ __device__ void performCrossOvers(RandSeed seed, Solution* population, int* exec
  * @param parent2 The second parent
  * @param child Where to save the child
  */
-__device__ void crossOver(RandSeed seed, Solution* parent1, Solution* parent2, Solution* child, int* executionTimes){
+__device__ void crossOver(RandSeed seed, Solution* parent1, Solution* parent2, Solution* child){
     int start = randInt(seed) % taskCount;
     int end = randInt(seed) % (taskCount - start) + start;
 
@@ -290,7 +272,7 @@ __device__ void crossOver(RandSeed seed, Solution* parent1, Solution* parent2, S
             child->tasks[i] = parent1->tasks[i];
         }
     }
-    measureSolutionCmax(child, executionTimes);
+    measureSolutionCmax(child);
 }
 
 
@@ -299,23 +281,16 @@ __device__ void crossOver(RandSeed seed, Solution* parent1, Solution* parent2, S
  * @param seed The seed to use for random numbers
  * @param population The population to mutate
  */
-__device__ void performMutations(RandSeed seed, Solution* population, int* executionTimes){
-    __shared__ int mutatingIdx[(int)(POPULATION_SIZE * SOLUTION_MUTATION_CHANCE)];
-    int mutationCount = POPULATION_SIZE * SOLUTION_MUTATION_CHANCE;
-    int tId = threadIdx.x;
-
-    // Pick solutions to mutate
-    for(int i = tId; i < mutationCount; i += NUM_THREADS){
-        mutatingIdx[i] = randInt(seed) % POPULATION_SIZE;
-    }
-
-    // Mutate the solutions
-    for(int i = tId; i < mutationCount; i += NUM_THREADS){
-        int idx = mutatingIdx[i];
+__device__ void performMutations(RandSeed seed, Solution* population){
+    for(int i = 0; i < POPULATION_SIZE; ++i){
+        // TODO: Optimize
+        if((randInt(seed) / (float)RAND_MAX) >= SOLUTION_MUTATION_CHANCE){
+            continue;
+        }
         if((randInt(seed) / (float)RAND_MAX) <= GREEDY_MUTATION_CHANCE){
-            greedyMutate(&population[idx], executionTimes);
+            greedyMutate(&population[i]);
         } else {
-            mutate(seed, &population[idx], executionTimes);
+            mutate(seed, &population[i]);
         }
     }
 }
@@ -326,7 +301,7 @@ __device__ void performMutations(RandSeed seed, Solution* population, int* execu
  * @param seed The seed to use for random numbers
  * @param solution The solution to mutate
  */
-__device__ void mutate(RandSeed seed, Solution* solution, int* executionTimes){
+__device__ void mutate(RandSeed seed, Solution* solution){
     for(int i = 0; i < MUTATIONS_IN_SOLUTION; ++i){
         int pos1 = randInt(seed) % taskCount;
         int pos2 = randInt(seed) % taskCount;
@@ -334,7 +309,7 @@ __device__ void mutate(RandSeed seed, Solution* solution, int* executionTimes){
         solution->tasks[pos1] = solution->tasks[pos2];
         solution->tasks[pos2] = temp;
     }
-    measureSolutionCmax(solution, executionTimes);
+    measureSolutionCmax(solution);
 }
 
 
@@ -342,7 +317,7 @@ __device__ void mutate(RandSeed seed, Solution* solution, int* executionTimes){
  * Performs a greedy mutation on a solution
  * @param solution The solution to mutate
  */
-__device__ void greedyMutate(Solution* solution, int* executionTimes){
+__device__ void greedyMutate(Solution* solution){
     long long processorUsage[MAX_PROCESSORS];
 
     for(int i = 0; i < processorCount; ++i){
@@ -382,7 +357,7 @@ __device__ void greedyMutate(Solution* solution, int* executionTimes){
         processorUsage[procMostInd] -= shortestTaskTime;
     }
 
-    measureSolutionCmax(solution, executionTimes);
+    measureSolutionCmax(solution);
 }
 
 
@@ -409,37 +384,24 @@ __device__ void updateBestSolution(Solution* population, Solution* bestSolution)
  * @param population The population to migrate to
  * @param bestSolution The best solution to migrate
  */
-__device__ void performMigration(RandSeed seed, Solution* population, const Solution* bestSolution, int* executionTimes){
-    int tId = threadIdx.x;
-    __shared__ bool doMigration;
-
-    if(tId == 0){
-        doMigration = (randInt(seed) / (float)RAND_MAX) < MIGRATION_CHANCE;
+__device__ void performMigration(RandSeed seed, Solution* population, const Solution* bestSolution){
+    if((randInt(seed) / (float)RAND_MAX) >= MIGRATION_CHANCE){
+        return;
     }
 
-    __syncthreads();
-    if(!doMigration) return;
-
-
-    __shared__ long long currentBestCmax;
-    currentBestCmax = LLONG_MAX;
-
-    __syncthreads();
-
-    for(int i = tId; i < POPULATION_SIZE; i += NUM_THREADS){
-        atomicMin(&currentBestCmax, population[i].cmax);
+    long long currentBestCmax = LLONG_MAX;
+    for(int i = 0; i < POPULATION_SIZE; ++i){
+        if(population[i].cmax < currentBestCmax){
+            currentBestCmax = population[i].cmax;
+        }
     }
-
-    __syncthreads();
 
     if(currentBestCmax > bestSolution->cmax){
         population[POPULATION_SIZE - 1].cmax = bestSolution->cmax;
-
-        for(int i = tId; i < taskCount; i += NUM_THREADS){
-            population[POPULATION_SIZE - 1].tasks[i] = bestSolution->tasks[i];
-        }
+        memcpy(population[POPULATION_SIZE - 1].tasks, bestSolution->tasks, sizeof(ProcId) * taskCount);
     } else {
-        if(tId == 0) buildSolutionGreedy(seed, &population[POPULATION_SIZE - 1], executionTimes);
+        greedyMutate(&population[POPULATION_SIZE - 1]);
+        buildSolutionGreedy(seed, &population[POPULATION_SIZE - 1]);
     }
 }
 
@@ -448,7 +410,7 @@ __device__ void performMigration(RandSeed seed, Solution* population, const Solu
  * Measures the Cmax of a solution and saves it into the solution
  * @param solution The solution to measure
  */
-__device__ void measureSolutionCmax(Solution* solution, int* executionTimes){
+__device__ void measureSolutionCmax(Solution* solution){
     long long processorUsage[MAX_PROCESSORS];
 
     for(int i = 0; i < processorCount; ++i){
@@ -483,8 +445,8 @@ void loadData(int** executionTimes, int* processorCount, int* taskCount){
 }
 
 int main(int argc, char** argv){
-    int procCnt = 10;
-    int taskCnt = 200;
+    int procCnt;
+    int taskCnt;
     int* execTimes;
     loadData(&execTimes, &procCnt, &taskCnt);
 
@@ -493,12 +455,10 @@ int main(int argc, char** argv){
         treshold = atoll(argv[1]);
     }
 
-    bool FALSE = false;
 
     cudaMemcpyToSymbol(processorCount, &procCnt, sizeof(int));
     cudaMemcpyToSymbol(taskCount, &taskCnt, sizeof(int));
     cudaMemcpyToSymbol(executionTimes, execTimes, sizeof(int) * taskCnt);
-    cudaMemcpyToSymbol(isFinished, &FALSE, sizeof(bool));
 
     CudaOutput cudaOutput_host;
     CudaOutput* cudaOutput_dev;
@@ -508,7 +468,7 @@ int main(int argc, char** argv){
 
     const clock_t startTime = clock();
     const unsigned int seed = (unsigned int)(time(NULL) & 0x7fffffff);
-    genetic<<<NUM_BLOCKS, NUM_THREADS>>>(treshold, seed, cudaOutput_dev);
+    genetic<<<1, NUM_THREADS>>>(treshold, seed, cudaOutput_dev);
     cudaDeviceSynchronize();
 
     fprintf(stderr, "After kernel: %s\n", cudaGetErrorString(cudaGetLastError()));
@@ -521,14 +481,6 @@ int main(int argc, char** argv){
     fprintf(stderr, "Work time: %.1fs\n", (double)workTime / CLOCKS_PER_SEC);
     fprintf(stderr, "Best Cmax: %lld\n", cudaOutput_host.bestCmax);
     fprintf(stderr, "Iterations: %d\n", cudaOutput_host.iterations);
-    /*fprintf(stderr, "Best solution:\n");
-
-    for(int i = 0; i < taskCnt; i += 20){
-        for(int j = 0; j < 20 && i + j < taskCnt; ++j){
-            fprintf(stderr, "%3d ", cudaOutput_host.tasks[i + j]);
-        }
-        fprintf(stderr, "\n");
-    }*/
 
     cudaFree(cudaOutput_dev);
 }
