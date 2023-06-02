@@ -24,7 +24,7 @@
 
 // Diagnostyka
 #define ENABLE_EXPORT false                   // Czy eksportować wyniki na koniec
-#define ENABLE_PRINT_STATS true               // Czy wyświetlać statystyki
+#define ENABLE_PRINT_STATS false              // Czy wyświetlać statystyki
 #define PRINT_STATS_FREQ 5000                 // Co ile iteracji wyświetlać status
 
 typedef unsigned char ProcId;
